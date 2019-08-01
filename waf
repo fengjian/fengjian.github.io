@@ -1,0 +1,192 @@
+
+# 基于OpenResty的轻量级Web应用防火墙的一些思考
+
+## OpenResty
+
+### 简介 
+
+OpenResty® 是一个基于 Nginx 与 Lua 的高性能 Web 平台，其内部集成了大量精良的 Lua 库、第三方模块以及大多数的依赖项。用于方便地搭建能够处理超高并发、扩展性极高的动态 Web 应用、Web 服务和动态网关。
+
+
+### 使用OpenResty编写web应用防火墙的好处
+
+- 直接继承了Nginx对http等协议处理的能力，久经考验，比自己维护一套http server在可靠性、性能以及http协议完整支持上好的多
+- OpenResty集成的luajit可以使用Lua脚本调动 Nginx 支持的各种 C 以及 Lua 模块，方便开发集成新功能
+- 高性能，可以解决10K 乃至 1000K级别的问题
+- 社区活跃，生态丰富，继承了Nginx全部模块能力外加Resty的lua扩展（可以很方便的支持比如Intel的SSL硬件加速卡）
+
+
+## 无痛迁移
+
+出于保留nsfocus-waf的使用习惯和各种外部联动体系（比如日志收集系统），新的实现需要做到如下几点：
+
+- 模块化设计，和nsfocus-waf的算法性策略、规则性策略保持一致
+- 策略/规则相关信息保持和原来的nsfocus-waf字段一致，格式从xml换成更利于处理的json
+- 兼容wcl规则，确保已经存在的nsfocus-waf内置规则和自定义规则和原来的使用方式完全一致
+- 日志格式保持和nsfocus-waf的字段兼容性
+- 解决原来的nsfocus-waf修改站点配置和修改规则性策略导致漫长的编译时间问题
+
+### 解决站点配置编译问题
+
+使用json配置reload，无须编译
+
+### 解决wcl规则编译问题
+
+不完整猜测，nsfocus-waf会将某个策略选择的所有wcl规则解析后，生成c函数外加ac自动机预过滤串，然后调用gcc编译为一个新的c动态库，最后加载。
+
+新的实现考虑离线预处理，WAF运行时不再有编译开销。
+注：自定义的wcl规则可以运行时直接转换成lua函数，这个编译过程非常快，现存所有规则编译为lua也不到0.1秒
+
+- 方案1: 预生成规则包合集，其含有的所有wcl规则，将其编译为lua函数单文件集合，以这个单lua文件作为整个规则升级包
+- 方案2: 预生成规则包合集，其含有的所有wcl规则，将其编译为LLVM IR，最后编译成单一动态库，以这个单动态库为整个规则升级包
+
+然后运行时根据策略配置动态调用相应的规则函数来做匹配，不过规则的匹配一般都需要做一道粗过滤，否则遍历规则函数匹配开销将非常大。
+这个时候我们需要完整理解wcl的语法树，抽取所有正则表达式编号和规则函数标签的映射关系，使用Intel的hyperscan做并行匹配预过滤。
+然后根据命中的正则表达式编号找到对应的规则函数，调用规则函数做更具体的匹配。
+
+### wcl编译器(lex/yacc)
+
+为了性能使用c编写，手写解析器虽然不难但确实枯燥无味，我们直接用lex/yacc。注：预先定义好语法的BNF，能大大节省时间。
+由于没有文档，我们直接看wcl的例子定义好BNF。
+我们将解析器前端和后端编译分离，解析器只负责生成逆波兰表达式的AST，而根据AST具体编译成lua还是LLVM IR由具体后端实现。
+
+#### 编译前端 ####
+
+wcl词法部分片段
+
+```
+
+%{
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+#include "wcl.h"
+#include "wcl.tab.h"
+%}
+
+%%
+
+"local"         { return LOCAL; }
+"sub"           { return SUB; }
+"while"	        { return WHILE; }
+"for"			{ return FOR; }
+"in"			{ return IN; }
+"continue"		{ return CONTINUE; }
+"break"			{ return BREAK; }
+
+...省略N行
+
+```
+
+wcl语法部分片段
+
+```
+
+%token <idval> IDENTIFIER
+%token <intval> CONSTANT_INT
+%token <strval> STRING_LITERAL
+
+%token LOCAL
+%token CMP
+%token OP_ASSIGN
+%token SUB
+%token WHILE FOR IN
+%token CONTINUE BREAK
+%token IF ELSE
+%token RETURN
+
+%type <intval> primary_expression postfix_expression argument_expression_list unary_expression conditional_expression assignment_expression expression identifier_expression
+
+...省略N行
+
+```
+
+#### 编译后端效果 ####
+
+
+lua后端，由于lua没有continue语法，这里我们用luajit5.1移植lua5.2的goto代替
+
+```
+
+function rule_19136514(_r)
+  if wcl_co(_r.uri, "XXXXXXX(人工打码)") then
+    return true
+  end
+
+  for key,value in pairs(_r.arg_list) do
+    if wcl_lbetw(value, 0,16) then
+      goto continue
+    end
+
+    if wcl_co(value, "XXXXXXX(人工打码)") then
+      return true
+    end
+
+    ::continue::
+  end
+
+...省略N行
+end
+
+```
+
+### hyperscan ###
+
+
+#### 简介 ####
+
+Hyperscan是一款来自于Intel的高性能的正则表达式匹配库。它是基于X86平台以PCRE为原型而开发的。在支持PCRE的大部分语法的前提下，Hyperscan增加了特定的语法和工作模式来保证其在真实网络场景下的实用性。与此同时，大量高效算法及IntelSIMD*指令的使用实现了Hyperscan的高性能匹配。Hyperscan适用于部署在诸如DPI/IPS/IDS/FW等场景中,目前已经在全球多个客户网络安全方案中得到实际的应用。
+
+
+#### 使用hyperscan做预过滤 ####
+
+上文已经提到，wcl编译器的中间处理机已经将所有规则的字符串抽取出来，将其变成文本格式的hyperscan db描述
+
+```
+0:/st[A-Z]r/HV
+1:/str1/HV
+2:/str2/HV
+
+```
+
+通过自行编写的工具程序将hyperscan文本形态编译为二进制形态
+
+```
+
+hs_op -s sql_db.txt -t sql_db.bin
+
+```
+
+然后在OpenResty通过luaffi调用自行编写的辅助libhscan库
+
+```
+
+local libhscan = ffi.load("/opt/openresty/nginx/lib/libhscan.so")
+
+ffi.cdef[[
+struct match_groups {
+	struct {
+	unsigned long long from;
+	unsigned long long to;
+	unsigned int id;
+	} groups[2048];
+	int count;
+};
+
+int khs_block_scan_parallel(const char *file, const char **inputs, unsigned long long *lengths, void **ctxs, size_t size);
+int khs_block_scan(const char *file, const char *input, unsigned long long length, void *ctx);
+
+...省略N行
+
+```
+
+就可以做预过滤了
+
+```
+
+local modhs = require "hs_scan"
+local m = modhs.match(str, "/opt/rule_regex.bin")
+
+...省略N行
+
+```
